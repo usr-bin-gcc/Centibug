@@ -1,0 +1,31 @@
+# Project:   application
+
+
+# Toolflags:
+CCflags = -c -IRISC_OSLib: -throwback 
+C++flags = -c -IRISC_OSLib: -throwback 
+Linkflags = -aif -c++ -o $@
+ObjAsmflags = -throwback -NoCache 
+CMHGflags = 
+LibFileflags = -c -o $@
+Squeezeflags = -o $@
+ModSqzflags = -o $@
+
+OBJS = @.o.main RISC_OSLib:o.risc_oslib C:o.stubs 
+
+# Final targets:
+@.application: $(OBJS)
+        Link $(Linkflags) $(OBJS)
+
+
+.INIT:
+        @CDir o
+
+# User-editable dependencies:
+
+# Static dependencies:
+
+@.o.main:  @.c.main
+        cc $(ccflags) -o @.o.main @.c.main 
+
+

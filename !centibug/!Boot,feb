@@ -1,0 +1,4 @@
+Set <CentiBug$Dir>  <Obey$Dir>
+Set <CentiBug$Path> <Obey$Dir>.
+Iconsprites <Obey$Dir>.!Sprites
+

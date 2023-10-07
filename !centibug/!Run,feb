@@ -1,0 +1,14 @@
+
+set CentiBug$Dir <Obey$Dir>
+set CentiBug$Path <Obey$Dir>.
+
+IconSprites <Obey$Dir>.!Sprites
+
+RMEnsure SharedCLibrary 3.50 RMLoad System:Modules.Clib
+RMEnsure SharedCLibrary 3.50 Error You need Clib 3.50 or later
+RMEnsure ColourTrans 0.52 RMLoad System:Modules.Colours
+RMEnsure ColourTrans 0.52 Error You need ColourTrans 0.52 or later
+|
+WimpSlot -min 100k -max 200k
+WimpSlot -min 100k
+Run <CentiBug$Dir>.application

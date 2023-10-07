@@ -1,0 +1,1205 @@
+/*******************************************************************************
+
+File        : c.main
+
+Date        : Saturday 10th June 2023
+
+Author      : Gavin Cawley
+
+Description : Basic implementation of Centipede for RiscOS.  I started this
+              sometime in the late 1980's, on an Acorn Archimedes A410/1, 
+              thought I might as well get it working properly.
+
+History     : ??/??/1989 v1.00 - non-desktop version found on a back-up.
+              25/12/2020 v1.10 - used timer so that it runs at the same speed
+                                 on more or less all hardware.  Improved game
+                                 logic.
+
+*******************************************************************************/
+
+#include <stdlib.h>
+#include <stdio.h>
+#include <math.h>
+                 
+#include "alarm.h"
+#include "bbc.h"
+#include "wimp.h"
+#include "wimpt.h"
+#include "resspr.h"
+#include "baricon.h"
+#include "res.h"
+#include "event.h"
+#include "menu.h"
+#include "dbox.h"
+#include "werr.h"
+#include "win.h"
+#include "template.h"
+#include "colourtran.h"
+#include "sprite.h"
+#include "flex.h"
+#include "heap.h"   
+#include "swis.h"
+
+/******************************************************************************
+*                                                                             *
+*                                   CONSTANTS                                 *
+*                                                                             *
+******************************************************************************/
+
+#define APP_NAME "CentiBug"
+
+#define MENU_ITEMS ">Info,Quit"
+#define IMENU_INFO 1
+#define IMENU_QUIT 2
+
+/******************************************************************************
+*                                                                             *
+*                              DATA STRUCTURES                                *
+*                                                                             *
+******************************************************************************/ 
+
+typedef struct
+{               
+   int mode;
+   int dx;
+   int dy;
+   int bpp;
+   int x;
+   int y;
+
+   sprite_factors sfactors;
+
+   wimp_paletteword palette[256];
+}
+ModeInfo;
+
+typedef struct
+{
+   sprite_area *area;
+   
+   sprite_id id;
+
+   sprite_id head, 
+             tail, 
+             mushroom1, 
+             mushroom2, 
+             mushroom3, 
+             flea, 
+             ship, 
+             ground,
+             missile,
+             blank,
+             explosion;
+} 
+sprDetails;
+
+/******************************************************************************
+*                                                                             *
+*                                 GLOBAL DATA                                 *
+*                                                                             *
+******************************************************************************/
+
+menu imenu;                       
+
+wimp_w gui_handle;
+
+double centipede_x = 0.0;
+                       
+sprDetails mySprite;
+
+int then;
+
+ModeInfo modeInfo;
+
+/******************************************************************************
+*                                                                             *
+*                         VARIOUS UTILITY FUNCTIONS                           *
+*                                                                             *
+******************************************************************************/
+
+void getModeInfo(void)
+{               
+   int dummy;
+                                         
+   (void)os_byte(135, &dummy, &modeInfo.mode);
+
+   modeInfo.dx  = bbc_vduvar(bbc_XEigFactor);
+   modeInfo.dy  = bbc_vduvar(bbc_YEigFactor);
+   modeInfo.bpp = 1 << bbc_vduvar(bbc_Log2BPP);
+   modeInfo.x   = 1 +  bbc_vduvar(bbc_XWindLimit);
+   modeInfo.y   = 1 +  bbc_vduvar(bbc_YWindLimit);
+
+   modeInfo.x <<= modeInfo.dx;
+   modeInfo.y <<= modeInfo.dy;
+
+   // set up palette for this mode               
+
+   colourtran_select_table(15, 0, -1, (void*)-1, &modeInfo.palette);
+                                                              
+   // set up sprite scaling factors for this mode
+
+   modeInfo.sfactors.xmag = modeInfo.dx ? 2 : 4;
+   modeInfo.sfactors.ymag = modeInfo.dy ? 2 : 4;
+   modeInfo.sfactors.xdiv = modeInfo.dx ? (1 << (modeInfo.dx - 1)) : 1;
+   modeInfo.sfactors.ydiv = modeInfo.dx ? (1 << (modeInfo.dy - 1)) : 1;
+}
+
+int getMonotonicTime(void)
+{
+   _kernel_swi_regs regs;
+
+   _kernel_swi(OS_ReadMonotonicTime, &regs, &regs);
+       
+   return regs.r[0];
+}
+
+/******************************************************************************
+*                                                                             *
+*                                 GAME LOGIC                                  *
+*                                                                             *
+******************************************************************************/
+
+typedef enum 
+{
+   Cell_Blank,   
+   Cell_Ground,                            
+   Cell_Missile,
+   Cell_Ship,
+   Cell_Mushroom1,
+   Cell_Mushroom2,
+   Cell_Mushroom3,
+   Cell_Explosion,
+   Cell_Flea,
+   Cell_Head,
+   Cell_Tail 
+}
+Cell;
+
+typedef enum { True = 1, False = 0 } Boolean;
+
+typedef enum { Left = -1, Right = 1 } Direction;
+
+typedef enum { Head = Cell_Head, Tail = Cell_Tail } SegmentType;
+
+typedef struct 
+{
+   Boolean active;    
+
+   int x, y;
+} 
+Missile;
+
+typedef struct
+{  
+   Boolean active;
+
+   int x, y;
+} 
+Spaceship;
+
+typedef struct
+{
+   Boolean active;
+
+   int x, y;
+} 
+Flea;
+
+typedef struct 
+{
+   Boolean active;
+
+   SegmentType type;
+
+   Direction heading;
+
+   int x, y;
+} 
+Segment;
+
+typedef struct
+{
+   Boolean active;
+
+   int counter;
+} 
+NewCentipede;
+
+typedef struct 
+{
+   Boolean active;
+
+   int x, y, counter;
+} 
+Explosion;
+
+Segment centipede[8];
+
+NewCentipede newCents;
+
+Flea flea;
+
+Explosion explosion;
+
+Missile missile;
+
+Spaceship ship;
+
+int score = 0;   
+
+int keyPressed = ' ';
+
+int centipedeTime;
+int missileTime;
+int shipTime;
+int explosionTime; 
+int fleaTime;
+
+                          
+#define ROWS    (32)
+#define COLUMNS (40)
+
+Cell map[COLUMNS][ROWS]; 
+
+unsigned changed[ROWS*COLUMNS];
+
+unsigned counter;
+
+#define RND(mod) ((rand()%(mod)))   
+    
+                     
+#define INKEY_M (101)
+#define INKEY_Z (97)
+#define INKEY_X (66) 
+
+int keyIsPressed(int chcode)
+{
+   os_regset regs;
+
+   regs.r[0] = 0x81; 
+   regs.r[1] = chcode ^ 0xFF;
+   regs.r[2] = 0xFF;
+
+   wimpt_complain(os_swix(OS_Byte, &regs));
+
+   return regs.r[1];
+}          
+
+void setMap(int x, int y, Cell value)
+{
+   map[x][y] = value;
+
+   changed[x*ROWS + y] = counter;
+}
+
+void gameInit(void)
+{                              
+   counter = 0;
+
+   for (int i = 0; i < COLUMNS; i++)
+   {  
+      for (int j = 0; j < ROWS; j++)
+      {
+         setMap(i, j, Cell_Blank);
+      }    
+   }
+                               
+   // scatter some mushrooms
+
+   for (int i = 0; i < 32; i++)
+   {
+      int j = RND(COLUMNS), k = RND(ROWS - 6);
+
+      setMap(j, k, Cell_Mushroom1);
+   }         
+
+   for (int i = 0; i < 8; i++)
+   {
+      centipede[i].active = False;
+   }
+
+   ship.x      = 19;
+   ship.y      = 26;
+   ship.active = True;
+
+   setMap(ship.x, ship.y, Cell_Ship);
+           
+   missile.active      = False;
+   explosion.active    = False; 
+   flea.active         = False;
+   flea.y              = 0;
+   flea.x              = 0;    
+   newCents.active     = True;
+   newCents.counter    = 0;                   
+
+   int time = getMonotonicTime();
+
+   centipedeTime = time;
+   missileTime   = time;
+   shipTime      = time;
+   explosionTime = time; 
+   fleaTime      = time; 
+}
+
+void newExplosion(int x, int y)
+{
+   explosion.active  = True;
+   explosion.x       = x;
+   explosion.y       = y;
+   explosion.counter = 0;      
+
+   setMap(explosion.x, explosion.y, Cell_Explosion);
+}
+
+void updateSpaceship(void)
+{
+   if (ship.active == True)
+   { 
+      setMap(ship.x, ship.y, Cell_Blank);
+              
+      if (keyIsPressed(INKEY_M) && (missile.active == False))
+      {
+         missile.active = True;
+         missile.x      = ship.x;
+         missile.y      = ship.y;
+         keyPressed     = ' ';
+      }
+
+      if (keyIsPressed(INKEY_Z) && (ship.x > 0))
+      {
+         ship.x--;
+
+         if (map[ship.x][ship.y] != Cell_Blank)
+         {
+            newExplosion(ship.x, ship.y);
+
+            ship.active = False;
+                                
+            return;
+         }
+
+         keyPressed = ' ';
+      }
+
+      if (keyIsPressed(INKEY_X) && (ship.x < 39))
+      {
+         ship.x++;
+
+         if (map[ship.x][ship.y] != Cell_Blank)
+         {
+            newExplosion(ship.x, ship.y);
+
+            ship.active = False;
+
+            return;
+         }                
+
+         keyPressed = ' ';
+      } 
+
+      setMap(ship.x, ship.y, Cell_Ship);
+   }
+}
+
+void updateExplosion(void)
+{
+   if (explosion.active == True)
+   {
+      if (explosion.counter < 32)
+      {
+         explosion.counter++;
+      }
+      else
+      {                       
+         setMap(explosion.x, explosion.y, Cell_Ship);
+
+         explosion.active = False;                 
+         ship.active      = True;
+      }
+   }
+}
+
+void updateMissile(void)
+{
+   if (missile.active == True)
+   {
+      if (map[missile.x][missile.y] == Cell_Missile)
+      {          
+         setMap(missile.x, missile.y, Cell_Blank);
+      }
+
+      if (missile.y > 0)
+      {
+         int a = map[missile.x][missile.y-1];
+ 
+         switch (a)
+         {
+            case Cell_Mushroom1: 
+            {  
+               setMap(missile.x, missile.y-1, Cell_Mushroom2);
+
+               missile.active = False;
+               score          = score + 5;
+      
+               break;
+            }
+            case Cell_Mushroom2: 
+            {  
+               setMap(missile.x, missile.y-1, Cell_Mushroom3);
+
+               score          = score + 5;
+               missile.active = False;
+      
+               break;
+            }
+            case Cell_Mushroom3:  
+            {  
+               setMap(missile.x, missile.y-1, Cell_Blank);
+
+               score          = score + 5;
+               missile.active = False;
+      
+               break;
+            } 
+            case Cell_Flea:  
+            {
+               setMap(missile.x, missile.y-1, Cell_Blank);
+
+               score          = score + 50;
+               flea.active    = False;
+               missile.active = False;   
+
+               break;
+            }   
+            case Cell_Head:
+            case Cell_Tail:
+            {
+               for (int i = 0; i < 8; i++)
+               {
+                  if ((centipede[i].active)           &&
+                      (centipede[i].x == missile.x)   && 
+                      (centipede[i].y == missile.y-1))
+                  {
+                     score += 50;
+                     centipede[i].active = False;
+
+                     if (i < 7)
+                     {
+                        centipede[i+1].type = Head;
+                     }
+
+                     setMap(centipede[i].x, centipede[i].y, Cell_Mushroom1);
+
+                     break;
+                  }
+               }
+
+               missile.active = False;
+
+               break;
+            }
+            default:   
+            {
+               missile.y--;              
+
+               setMap(missile.x, missile.y, Cell_Missile);
+            }
+         }
+      }
+      else
+      {
+         missile.active = False;
+      }
+   }
+}
+
+void updateFlea(void)
+{
+   if (flea.active == True)
+   {
+      if(RND(10) < 8 || flea.y == 26)
+      {
+         setMap(flea.x, flea.y, Cell_Blank);
+      }
+      else
+      {
+         setMap(flea.x, flea.y, Cell_Mushroom1);
+      }
+
+      if (flea.y < 26)
+      {             
+         flea.y++;
+
+         if (map[flea.x][flea.y] == Cell_Ship)
+         {
+            newExplosion(flea.x, flea.y);
+            flea.active = False;
+            ship.active = False;
+         }
+         else
+         {
+            setMap(flea.x, flea.y, Cell_Flea);
+         }
+      }
+      else
+      {             
+          flea.active = False;
+      }
+   }
+   else if (RND(128) == 0)
+   {                     
+      do
+      {
+         flea.x = RND(40);
+      }
+      while (map[flea.x][0] != Cell_Blank);
+
+      flea.y      = 0;
+      flea.active = True;
+
+      setMap(flea.x, flea.y, Cell_Flea);
+   }
+}
+                    
+void newCentipede(void)
+{
+   newCents.active  = True;
+   newCents.counter = 0;
+}
+
+void updateNewCentipede(void)
+{
+   if (newCents.active)
+   {
+      int idx                = newCents.counter;
+      centipede[idx].active  = True;
+      centipede[idx].x       = 20;
+      centipede[idx].y       = 0;
+      centipede[idx].heading = Left;
+      centipede[idx].type    = idx == 0 ? Head : Tail;
+
+      if (newCents.counter++ > 6)
+      {
+         newCents.counter = 0;
+         newCents.active  = False;
+      }
+   }
+}
+
+void updateCentipede(void)
+{                                       
+   for (int i = 0; i < 8; i++)
+   {  
+      if (centipede[i].active)
+      {
+         setMap(centipede[i].x, centipede[i].y, Cell_Blank);
+      }  
+   }
+
+   for (int i = 7; i >= 0; i--)
+   {                       
+      if (centipede[i].active)
+      {                       
+         if (centipede[i].type == Tail)
+         {
+            centipede[i].x = centipede[i-1].x;
+            centipede[i].y = centipede[i-1].y;   
+         }
+         else
+         {     
+            int newx = centipede[i].x + centipede[i].heading;
+
+            if (newx == -1 || newx == 40 || 
+                map[newx][centipede[i].y] != Cell_Blank)
+            {             
+               if (map[newx][centipede[i].y] == Cell_Ship)
+               {                                         
+                  ship.active = False;
+
+                  setMap(newx, centipede[i].y, Cell_Blank); 
+
+                  newExplosion(newx, centipede[i].y);
+               }
+
+               if (centipede[i].heading == Left)
+               {
+                  centipede[i].heading = Right;
+               }
+               else
+               {
+                  centipede[i].heading = Left;
+               }
+
+               if (map[centipede[i].x][centipede[i].y+1] == Cell_Blank)
+               {
+                  centipede[i].y++;
+               }                               
+               else if (map[centipede[i].x][centipede[i].y-1] == Cell_Blank)
+               {                              
+                  centipede[i].y--;
+               }
+               else
+               {  
+                  centipede[i].x += centipede[i].heading;
+               }  
+            }
+            else
+            {
+               centipede[i].x = newx;  
+            }
+     
+            if (centipede[i].y == 27)
+            {
+               centipede[i].active = False;
+
+               if (i < 7)
+               {        
+                  centipede[i+1].type = Head;
+               }  
+            }
+         }
+      }                   
+   }
+
+   // reverse iteration to enusre heads overwrite tails
+                           
+   Boolean active = False;
+
+   for (int i = 7; i >= 0; i--)
+   {  
+      if (centipede[i].active)
+      {
+         setMap(centipede[i].x, centipede[i].y, 
+            centipede[i].type == Head ? Cell_Head : Cell_Tail);
+
+         active = True;
+      }  
+   }                   
+
+   if (!active)
+   {
+      newCentipede();
+   }
+}
+
+void updateGame(void)
+{   
+   int time = getMonotonicTime();
+
+   if (missileTime < time)
+   {
+      updateMissile();
+
+      missileTime += 3;
+   }
+
+   if (shipTime < time)
+   {
+      updateSpaceship();
+
+      shipTime += 6;
+   }  
+
+   if (centipedeTime < time)
+   {
+      updateNewCentipede();
+      updateCentipede();
+
+      centipedeTime += 12;      
+   }
+
+   if (fleaTime < time)
+   {
+      updateFlea();
+
+      fleaTime += 6;
+   }   
+        
+   if (explosionTime < time)
+   {
+      updateExplosion();
+
+      explosionTime += 8;      
+   } 
+}
+
+/******************************************************************************
+*                                                                             *
+*                                   GUI CODE                                  *
+*                                                                             *
+******************************************************************************/
+
+
+void gui_force_redraw(void)
+{
+   wimp_redrawstr r;
+
+   r.w      = gui_handle;
+   r.box.x0 = 0;
+   r.box.y0 = -1024;
+   r.box.x1 = +1280;
+   r.box.y1 = 0;
+
+   wimp_force_redraw(&r);
+}
+
+void gui_redraw(wimp_w handle)
+{
+   BOOL more;
+ 
+   wimp_redrawstr r;
+
+   r.w = handle;
+
+   wimpt_noerr(wimp_redraw_wind(&r, &more));   
+     
+   while(more)
+   {           
+      // screen co-ordinates of the work area origin
+                                                          
+      int x = r.box.x0 - r.scx;
+      int y = r.box.y1 - r.scy;          
+
+      // work-area coordinates of the update rectangle
+                                               
+      wimp_box redraw;
+
+      redraw.x0 = r.g.x0 - r.box.x0 + r.scx;
+      redraw.y0 = r.g.y0 - r.box.y1 + r.scy;
+      redraw.x1 = r.g.x1 - r.box.x0 + r.scx;
+      redraw.y1 = r.g.y1 - r.box.y1 + r.scy;
+
+      // redraw sprites              
+
+      for (int i = 0; i < COLUMNS; i++)
+      {
+         for (int j = 0; j < ROWS; j++)
+         { 
+            sprite_id* id = NULL;
+          
+            switch (map[i][j])
+            {
+               case Cell_Mushroom1 : id = &mySprite.mushroom1; break;
+               case Cell_Mushroom2 : id = &mySprite.mushroom2; break;
+               case Cell_Mushroom3 : id = &mySprite.mushroom3; break;
+               case Cell_Ground    : id = &mySprite.ground;    break;
+               case Cell_Ship      : id = &mySprite.ship;      break;
+               case Cell_Missile   : id = &mySprite.missile;   break;
+               case Cell_Flea      : id = &mySprite.flea;      break;
+               case Cell_Explosion : id = &mySprite.explosion; break;
+               case Cell_Head      : id = &mySprite.head;      break;
+               case Cell_Tail      : id = &mySprite.tail;      break;
+            }  
+
+            if (id != NULL)
+            {
+               wimpt_complain(sprite_put_scaled(mySprite.area, id, 0, 
+                                 x + i*32, y  - j*32, 
+                                 &modeInfo.sfactors,
+                                (sprite_pixtrans*)modeInfo.palette));
+            }
+         }
+      }        
+                                
+      // see if there is another rectange to redraw
+
+      wimp_get_rectangle(&r, &more);
+   }         
+}
+
+void gui_updateWindow(wimp_w handle)
+{
+   // update snail window
+                              
+   BOOL more;
+
+   wimp_redrawstr r;
+                    
+   r.w      = handle;
+   r.box.x0 = -4096;           
+   r.box.y0 = -4096;
+   r.box.x1 = +4090;
+   r.box.y1 = +4096;
+      
+   wimpt_complain(wimp_update_wind(&r, &more));
+
+   while (more)
+   {
+      // screen co-ordinates of the work area origin
+                                                          
+      int x = r.box.x0 - r.scx;
+      int y = r.box.y1 - r.scy;          
+
+      // work-area coordinates of the update rectangle
+                                               
+      wimp_box redraw;
+
+      redraw.x0 = r.g.x0 - r.box.x0 + r.scx;
+      redraw.y0 = r.g.y0 - r.box.y1 + r.scy;
+      redraw.x1 = r.g.x1 - r.box.x0 + r.scx;
+      redraw.y1 = r.g.y1 - r.box.y1 + r.scy;
+
+      // redraw sprites              
+
+      for (int i = 0; i < COLUMNS; i++)
+      {
+         for (int j = 0; j < ROWS; j++)
+         {                                    
+            if (changed[i*ROWS + j] == counter)
+            {
+               sprite_id* id = NULL;
+          
+               switch (map[i][j])
+               {
+                  case Cell_Mushroom1 : id = &mySprite.mushroom1; break;
+                  case Cell_Mushroom2 : id = &mySprite.mushroom2; break;
+                  case Cell_Mushroom3 : id = &mySprite.mushroom3; break;
+                  case Cell_Ground    : id = &mySprite.ground;    break;
+                  case Cell_Ship      : id = &mySprite.ship;      break;
+                  case Cell_Missile   : id = &mySprite.missile;   break;
+                  case Cell_Flea      : id = &mySprite.flea;      break;
+                  case Cell_Explosion : id = &mySprite.explosion; break;
+                  case Cell_Head      : id = &mySprite.head;      break;
+                  case Cell_Tail      : id = &mySprite.tail;      break;
+                  case Cell_Blank     : id = &mySprite.blank;     break;
+               }  
+
+               if (id != NULL)
+               {
+                  wimpt_complain(sprite_put_scaled(mySprite.area, id, 0, 
+                                    x + i*32, y  - j*32, 
+                                    &modeInfo.sfactors, 
+                                    (sprite_pixtrans*)modeInfo.palette));
+               }
+            }
+         }
+      }  
+
+      wimp_get_rectangle(&r, &more);
+
+      counter++;
+   }  
+}
+
+void gui_open(wimp_openstr *openstr)
+{  
+   wimpt_noerr(wimp_open_wind(openstr));
+
+   wimp_caretstr caret_str;
+
+   caret_str.w      = gui_handle;
+   caret_str.i      = -1;      // caret in window work area
+   caret_str.x      = 0;
+   caret_str.y      = 0;
+   caret_str.height = 1<<25;   // caret is invisible
+   caret_str.index  = 0;
+
+   wimp_set_caret_pos(&caret_str);
+}
+      
+void gui_keyHandler(wimp_caretstr *cstr, int chcode)
+{
+   switch (chcode)
+   {
+      case 'z':
+      case 'Z':
+      case 'x':
+      case 'X':
+      case 'm':
+      case 'M':
+      case 0x0D: // return
+      {  
+         keyPressed = chcode;
+
+         break;
+      }               
+      default: 
+      {
+        chcode = ' ';
+      }
+   }
+}
+
+void gui_eventHandler(wimp_eventstr *e, void *handle)
+{
+   switch(e->e)
+   {
+      case wimp_EREDRAW:
+      {
+         gui_redraw(e->data.o.w);
+      
+         break;
+      }
+      case wimp_EOPEN:   // maximise or minimise window 
+      {
+         gui_open(&(e->data.o));
+      
+         break;
+      }
+      case wimp_ECLOSE:   // close window
+      {
+         wimpt_noerr(wimp_close_wind(e->data.o.w));
+       
+         break;
+      }
+      case wimp_EKEY:   // key pressed
+      {
+         gui_keyHandler(&(e->data.key.c), e->data.key.chcode);
+
+         break;
+      }
+   }
+}
+           
+void gui_create(void)
+{                        
+   wimp_wind *window = template_syshandle("Window");
+
+   if (window == 0)
+   {
+      exit(EXIT_FAILURE);
+   }
+
+   if (wimpt_complain(wimp_create_wind(window, &gui_handle)) != 0)
+   {
+      exit(EXIT_FAILURE);
+   }
+
+   win_register_event_handler(gui_handle, gui_eventHandler, NULL);
+}
+
+void gui_closeDown(void)
+{
+}
+
+
+void gui_update(int now, void *handle)
+{                        
+   double delta = 0.01*alarm_timedifference(then, now);
+
+   // update game
+
+   updateGame();
+                         
+   // redraw window
+
+   gui_updateWindow(gui_handle);
+                                              
+   // reset alarm
+
+   alarm_set(now + 2, gui_update, NULL);
+
+   then = now;
+}
+                 
+/******************************************************************************
+*                                                                             *
+*                                MENU HANDLING                                *
+*                                                                             *
+******************************************************************************/
+
+static void info_about(void)
+{
+   dbox d = dbox_new("ProgInfo");
+
+   if (d != NULL)
+   {
+      dbox_show(d);        
+      dbox_fillin(d);       
+      dbox_dispose(&d);     
+   }
+}
+
+static menu ipremenuproc(void *handle)
+{
+   return imenu;
+}
+
+static void imenuproc(void *handle, char *hit)
+{
+   switch (hit[0])  
+   {                
+      case IMENU_INFO:
+      {
+         info_about();
+
+         break;
+      }
+      case IMENU_QUIT:
+      {
+         exit(EXIT_SUCCESS);
+
+         break;
+      }
+   }
+}
+
+static void icon_left_click(wimp_i icon)
+{
+   wimp_wstate win_state;
+
+   wimpt_complain(wimp_get_wind_state(gui_handle, &win_state));
+
+   gui_open(&(win_state.o));
+}
+
+/******************************************************************************
+*                                                                             *
+*                                INITIALISATION                               *
+*                                                                             *
+******************************************************************************/
+
+/*******************************************************************************
+
+Function    : initialiseSpriteId
+
+Parameters  : sprite_id*   - pointer to sprite_id structure to be initialised
+              sprite_area* - pointer to the sprite area containing the sprite
+              char*        - string containing the name of the sprite
+
+Returns     : void
+
+Description : Look up the address of a named sprite in the given sprite area
+              and initialise the sprite_id structure so that it identifies the
+              sprite by it's address rather than by it's name, for the sake of
+              efficiency.
+
+See also    : initialiseSprites (used by)
+
+*******************************************************************************/                       
+
+void initialiseSpriteId(sprite_id *id, sprite_area *area, char *name)
+{
+   id->s.name = name;
+   id->tag    = sprite_id_name;
+
+   wimpt_complain(sprite_select_rp(area, id, &id->s.addr));
+                                         
+   id->tag = sprite_id_addr;
+}
+
+/*******************************************************************************
+
+Function    : initialiseSprites
+
+Parameters  : char* - string containing the filepath for the sprite file
+
+Returns     : void
+
+Description : Load sprites from file into a sprite_area and initialise the
+              sprite_id structures used to access each sprite efficiently.
+
+*******************************************************************************/
+                     
+void initialiseSprites(char *filename)
+{                 
+   // determine the size of the sprite file
+
+   os_regset regs;
+
+   regs.r[0] = 17; 
+   regs.r[1] = (int)filename;
+
+   wimpt_complain(os_swix(OS_File, &regs));
+
+   int size = regs.r[4] + 4;
+
+   // allocate memory for the sprite area on the heap and initialise
+
+   mySprite.area = (sprite_area*)heap_alloc(size);                  
+  
+   sprite_area_initialise(mySprite.area, size);                     
+
+   // load sprites into the sprite area
+
+   wimpt_complain(sprite_area_load(mySprite.area, filename));
+                                       
+   // initialise the sprite_id structures for each sprite
+
+   initialiseSpriteId(&mySprite.head,      mySprite.area, "head");
+   initialiseSpriteId(&mySprite.tail,      mySprite.area, "tail");
+   initialiseSpriteId(&mySprite.mushroom1, mySprite.area, "mushroom1");
+   initialiseSpriteId(&mySprite.mushroom2, mySprite.area, "mushroom2");
+   initialiseSpriteId(&mySprite.mushroom3, mySprite.area, "mushroom3");
+   initialiseSpriteId(&mySprite.flea,      mySprite.area, "flea");
+   initialiseSpriteId(&mySprite.ship,      mySprite.area, "ship");
+   initialiseSpriteId(&mySprite.ground,    mySprite.area, "ground");
+   initialiseSpriteId(&mySprite.missile,   mySprite.area, "missile");
+   initialiseSpriteId(&mySprite.blank,     mySprite.area, "blank");
+   initialiseSpriteId(&mySprite.explosion, mySprite.area, "explosion");
+}
+
+/******************************************************************************
+*                                                                             *
+*                                MAIN PROGRAM                                 *
+*                                                                             *
+******************************************************************************/
+
+int main(void)
+{                                         
+   wimpt_init(APP_NAME);
+
+   res_init(APP_NAME);   
+
+   template_init();              
+
+   dbox_init();     
+
+   gui_create();
+
+   baricon("!centibug", (int)resspr_area(), icon_left_click);
+
+   imenu = menu_new(APP_NAME, MENU_ITEMS);
+                    
+   if (imenu == NULL)
+   {
+      return EXIT_FAILURE;
+   }
+
+   if (!event_attachmenumaker(win_ICONBAR, ipremenuproc, imenuproc, 0))
+   {
+      return EXIT_FAILURE;
+   }                    
+
+   // register icon menu and middle click handler 
+
+   if (!event_attachmenumaker(win_ICONBAR, ipremenuproc, imenuproc, 0))
+   {
+      return FALSE;
+   }               
+                 
+   // get information about current screen mode
+
+   getModeInfo();
+                                          
+   // load sprites and initialise associated data structures
+
+   initialiseSprites("<CentiBug$Dir>.Sprites");
+ 
+   // initialise game logic
+
+   gameInit();
+
+   // start animation
+
+   alarm_init();
+
+   then = alarm_timenow();
+
+   alarm_set(then + 2, gui_update, NULL);
+
+   // main even processing loop
+
+   while (TRUE) 
+   {
+      event_process();
+   }
+                    
+   //gui_closeDown();
+
+   wimp_closedown();
+
+   return EXIT_SUCCESS;
+}
+
+/******************************************************************************/

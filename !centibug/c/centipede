@@ -1,0 +1,626 @@
+/*******************************************************************************
+
+File        : c.centipede
+
+Date        : Friday 25th December 2020
+
+Author      : Gavin Cawley
+
+Description : Basic implementation of Centipede for RiscOS.  I started this
+              sometime in the late 1980's, on an Acorn Archimedes A410/1, 
+              thought I might as well get it working properly.
+
+History     : ??/??/1989 v1.00 - Version that was found on a back-up.
+              25/12/2020 v2.00 - used timer so that it runs at the same speed
+                                 on more or less all hardware.  Improved game
+                                 logic.
+
+*******************************************************************************/
+
+#include <stdio.h>
+#include <stdlib.h>
+
+#include "bbc.h"
+#include "swis.h"
+
+#define mode   bbc_mode
+#define vduq   bbc_vduq
+#define cursor bbc_cursor
+#define cls    bbc_cls
+#define tab    bbc_tab
+#define vdu    bbc_vdu
+#define inkey  bbc_inkey
+
+#define rnd(mod) (rand()%mod)   
+
+typedef enum { True = 1, False = 0 } Boolean;
+
+typedef enum { Left = -1, Right = 1 } Direction;
+
+typedef enum { Head = 230, Tail = 231 } SegmentType;
+
+typedef enum 
+{
+   Icon_Blank         = ' ',   
+   Icon_Ground        = '~',                            
+   Icon_Missile       = '!',
+   Icon_Ship          = 224,
+   Icon_Mushroom1     = 225,
+   Icon_Mushroom2     = 226,
+   Icon_Mushroom3     = 227,
+   Icon_Explosion     = 228,
+   Icon_Flea          = 229,
+   Icon_CentipedeHead = 230,
+   Icon_CentipedeTail = 231
+}
+Icon;
+
+typedef struct 
+{
+   Boolean active;    
+
+   int x, y;
+} 
+Missile;
+
+typedef struct
+{  
+   Boolean active;
+
+   int x, y;
+} 
+Spaceship;
+
+typedef struct
+{
+   Boolean active;
+
+   int x, y;
+} 
+Flea;
+
+typedef struct 
+{
+   Boolean active;
+
+   SegmentType type;
+
+   Direction heading;
+
+   int x, y;
+} 
+Segment;
+
+typedef struct
+{
+   Boolean active;
+
+   int counter;
+} 
+NewCentipede;
+
+typedef struct 
+{
+   Boolean active;
+
+   int x, y, counter;
+} 
+Explosion;
+
+Segment centipede[8];
+
+NewCentipede newCents;
+
+Flea flea;
+
+Explosion explosion;
+
+Missile missile;
+
+Spaceship ship;
+
+int score = 0;
+
+int map[40][27];
+
+int getMonotonicTime(void)
+{
+   _kernel_swi_regs regs;
+
+   _kernel_swi(OS_ReadMonotonicTime, &regs, &regs);
+       
+   return regs.r[0];
+}
+
+void init(void)
+{
+
+   cursor(0);
+   cls();
+   tab(0, 30);
+   printf(" Score 0");
+   tab(0, 28);
+   printf("~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~");
+
+   for(int i = 0; i < 40; i++)
+   {                        
+      for (int j = 0; j < 27; j++)
+      {
+         map[i][j] = Icon_Blank;   
+      }
+   }
+
+   for (int i = 0; i < 32; i++)
+   {
+      int j = rnd(40), k = rnd(26);
+
+      tab(j, k);
+      vdu(Icon_Mushroom1);
+      map[j][k] = Icon_Mushroom1;
+   }
+
+   for (int i = 0; i < 8; i++)
+   {
+      centipede[i].active = False;
+   }
+
+   ship.x              = 19;
+   ship.y              = 26;
+   map[ship.x][ship.y] = Icon_Ship;           
+   missile.active      = False;
+   explosion.active    = False; 
+   flea.active         = False;
+   flea.y              = 0;
+   flea.x              = 0;
+}
+
+void newExplosion(int x, int y)
+{
+   explosion.active  = True;
+   explosion.x       = x;
+   explosion.y       = y;
+   explosion.counter = 0;
+}
+
+void updateSpaceship(void)
+{
+   if (ship.active == True)
+   {
+      tab(ship.x, ship.y);
+      vdu(Icon_Blank);  
+      map[ship.x][ship.y] = Icon_Blank;
+
+      if (inkey(-102) && (missile.active == False))
+      {
+         missile.active = True;
+         missile.x      = ship.x;
+         missile.y      = ship.y;
+      }
+
+      if ((inkey(-98)) && (ship.x > 0))
+      {
+         ship.x--;
+
+         if (map[ship.x][ship.y] != Icon_Blank)
+         {
+            newExplosion(ship.x, ship.y);
+
+            ship.active = False;
+
+            return;
+         }
+      }
+
+      if ((inkey(-67)) && (ship.x < 39))
+      {
+         ship.x++;
+
+         if (map[ship.x][ship.y] != Icon_Blank)
+         {
+            newExplosion(ship.x, ship.y);
+
+            ship.active = False;
+
+            return;
+         }
+      }
+      
+      tab(ship.x, ship.y);
+      vdu(Icon_Ship);                
+      map[ship.x][ship.y] = Icon_Ship;
+   }
+}
+
+void updateExplosion(void)
+{
+   if (explosion.active == True)
+   {
+      if (explosion.counter < 16)
+      {
+         vduq(23,
+              Icon_Explosion,
+              rnd(255) & 0x3C,
+              rnd(255) & 0x7E,
+              rnd(255) & 0xFF,
+              rnd(255) & 0xFF,
+              rnd(255) & 0xFF,
+              rnd(255) & 0xFF,
+              rnd(255) & 0x7E,
+              rnd(255) & 0x3C);
+         tab(explosion.x, explosion.y);
+         vdu(Icon_Explosion);
+         explosion.counter++;
+      }
+      else
+      {
+         tab(explosion.x, explosion.y);
+         vdu(Icon_Blank);
+         explosion.active = False;
+      }
+   }
+}
+
+void updateMissile(void)
+{
+   if (missile.active == True)
+   {
+      if (map[missile.x][missile.y] == Icon_Missile)
+      {
+         tab(missile.x, missile.y);
+         vdu(Icon_Blank);          
+         map[missile.x][missile.y] = Icon_Blank;
+      }
+
+      if (missile.y > 0)
+      {
+         int a = map[missile.x][missile.y-1];
+ 
+         switch (a)
+         {
+            case Icon_Mushroom1: 
+            {  
+               score += 5;      
+               map[missile.x][missile.y-1] = Icon_Mushroom2;
+               tab(missile.x, missile.y-1);
+               vdu(Icon_Mushroom2);
+               missile.active = False;
+      
+               break;
+            }
+            case Icon_Mushroom2: 
+            {  
+               score += 5;      
+               map[missile.x][missile.y-1] = Icon_Mushroom3;
+               tab(missile.x, missile.y-1);
+               vdu(Icon_Mushroom3);
+               missile.active = False;
+      
+               break;
+            }
+            case Icon_Mushroom3:  
+            {  
+               score += 5;      
+               map[missile.x][missile.y-1] = Icon_Blank;
+               tab(missile.x, missile.y - 1);
+               vdu(Icon_Blank);
+               missile.active = False;
+      
+               break;
+            } 
+            case Icon_Flea:  
+            {
+               score += 50;
+               flea.active = False;
+               missile.active = False;
+               map[missile.x][missile.y-1] = Icon_Blank;
+               break;
+            }   
+            case Icon_CentipedeHead:
+            case Icon_CentipedeTail:
+            {
+               for (int i = 0; i < 8; i++)
+               {
+                  if ((centipede[i].active)           &&
+                      (centipede[i].x == missile.x)   && 
+                      (centipede[i].y == missile.y-1))
+                  {
+                     score += 50;
+                     centipede[i].active = False;
+
+                     if (i < 7)
+                     {
+                        centipede[i+1].type = Head;
+                     }
+
+                     map[centipede[i].x][centipede[i].y] = Icon_Mushroom1;
+                     tab(centipede[i].x, centipede[i].y);
+                     vdu(Icon_Mushroom1);
+                     break;
+                  }
+               }
+
+               missile.active = False;
+
+               break;
+            }
+            default:   
+            {
+               missile.y--;
+               tab (missile.x, missile.y);
+               vdu(Icon_Missile);
+               map[missile.x][missile.y] = Icon_Missile;
+            }
+         }
+      }
+      else
+      {
+         missile.active = False;
+      }
+   }
+}
+
+void updateFlea(void)
+{
+   if (flea.active == True)
+   {
+      tab (flea.x, flea.y);
+
+      if(rnd(10) < 8 || flea.y == 26)
+      {
+         vdu(Icon_Blank);
+         map[flea.x][flea.y] = Icon_Blank;
+      }
+      else
+      {
+         vdu(Icon_Mushroom1);
+         map[flea.x][flea.y] = Icon_Mushroom1;
+      }
+
+      if (flea.y < 26)
+      {             
+         flea.y++;
+
+         if (map[flea.x][flea.y] == Icon_Ship)
+         {
+            newExplosion(flea.x, flea.y);
+            flea.active = False;
+            ship.active = False;
+         }
+         else
+         {
+            tab (flea.x, flea.y);
+            vdu(Icon_Flea);
+            map[flea.x][flea.y] = Icon_Flea;
+         }
+      }
+      else
+      {             
+          flea.active = False;
+      }
+   }
+   else if (rnd(128) == 0)
+   {                     
+      do
+      {
+         flea.x = rnd(40);
+      }
+      while (map[flea.x][0] != Icon_Blank);
+
+      flea.y      = 0;
+      flea.active = True;
+
+      map[flea.x][flea.y] = Icon_Flea;
+      tab(flea.x, flea.y);
+      vdu(Icon_Flea);
+   }
+}
+                    
+void newCentipede(void)
+{
+   newCents.active  = True;
+   newCents.counter = 0;
+}
+
+void updateNewCentipede(void)
+{
+   if (newCents.active)
+   {
+      int idx                = newCents.counter;
+      centipede[idx].active  = True;
+      centipede[idx].x       = 20;
+      centipede[idx].y       = 0;
+      centipede[idx].heading = Left;
+      centipede[idx].type    = idx == 0 ? Head : Tail;
+
+      if (newCents.counter++ > 6)
+      {
+         newCents.counter = 0;
+         newCents.active  = False;
+      }
+   }
+}
+
+void updateCentipede(void)
+{                                       
+   for (int i = 0; i < 8; i++)
+   {  
+      if (centipede[i].active)
+      {
+         map[centipede[i].x][centipede[i].y] = Icon_Blank;
+         tab(centipede[i].x, centipede[i].y);
+         vdu(Icon_Blank);
+      }  
+   }
+
+   for (int i = 7; i >= 0; i--)
+   {                       
+      if (centipede[i].active)
+      {                       
+         if (centipede[i].type == Tail)
+         {
+            centipede[i].x = centipede[i-1].x;
+            centipede[i].y = centipede[i-1].y;   
+         }
+         else
+         {     
+            int newx = centipede[i].x + centipede[i].heading;
+
+            if (newx == -1 || newx == 40 || 
+                map[newx][centipede[i].y] != Icon_Blank)
+            {             
+               if (map[newx][centipede[i].y] == Icon_Ship)
+               {                                         
+                  ship.active               = False;
+                  map[newx][centipede[i].y] = Icon_Blank;
+                  newExplosion(newx, centipede[i].y);
+               }
+
+               if (centipede[i].heading == Left)
+               {
+                  centipede[i].heading = Right;
+               }
+               else
+               {
+                  centipede[i].heading = Left;
+               }
+
+               if (map[centipede[i].x][centipede[i].y+1] == Icon_Blank)
+               {
+                  centipede[i].y++;
+               }                               
+               else if (map[centipede[i].x][centipede[i].y-1] == Icon_Blank)
+               {                              
+                  centipede[i].y--;
+               }
+               else
+               {  
+                  centipede[i].x += centipede[i].heading;
+               }  
+            }
+            else
+            {
+               centipede[i].x = newx;  
+            }
+     
+            if (centipede[i].y == 27)
+            {
+               centipede[i].active = False;
+
+               if (i < 7)
+               {        
+                  centipede[i+1].type = Head;
+               }  
+            }
+         }
+      }                   
+   }
+   
+   // reverse iteration to enusre heads overwrite tails
+                           
+   Boolean active = False;
+
+   for (int i = 7; i >= 0; i--)
+   {  
+      if (centipede[i].active)
+      {
+         map[centipede[i].x][centipede[i].y] = centipede[i].type;
+         tab(centipede[i].x, centipede[i].y);
+         vdu(centipede[i].type);
+
+         active = True;
+      }  
+   }                   
+
+   if (!active)
+   {
+      newCentipede();
+   }
+}
+
+int main(int argc, char *argv[])
+{   
+   mode(9);
+ 
+   vduq(23, Icon_Ship,          16,  56,  84, 146, 146, 254,  56,  56);
+   vduq(23, Icon_Mushroom1,      0,  24, 102, 129, 231,  24,  24,  24);
+   vduq(23, Icon_Mushroom2,      0,  24, 102, 129, 231,  24,   0,   0); 
+   vduq(23, Icon_Mushroom3,      0,  24, 102,   0,   0,   0,   0,   0);
+   vduq(23, Icon_Explosion,      0,   0,   0,   0,   0,   0,   0,   0);
+   vduq(23, Icon_Flea,          12,  50,  74, 132, 152, 100, 144, 204);
+   vduq(23, Icon_CentipedeHead, 24, 102, 137, 157, 129, 102,  24,   0);
+   vduq(23, Icon_CentipedeTail, 24, 102, 129, 129, 129, 102,  24,  24); 
+
+   score = 0;
+
+   for (int lives = 3; lives > 0; lives--)
+   {
+      init();
+       
+      int time          = getMonotonicTime();
+      int centipedeTime = time;
+      int missileTime   = time;
+      int shipTime      = time;
+      int explosionTime = time; 
+      int fleaTime      = time;
+      ship.active       = True;
+
+      for (int i = 0; i < lives; i++)
+      {
+         tab(38-i, 30);
+         vdu(Icon_Ship);
+      }
+
+      do 
+      {                        
+         time = getMonotonicTime();
+
+         if (missileTime < time)
+         {
+            updateMissile();
+
+            missileTime += 2;
+         }
+
+         if (shipTime < time)
+         {
+            updateSpaceship();
+
+            shipTime += 3;
+         }  
+
+         if (centipedeTime < time)
+         {
+            updateNewCentipede();
+            updateCentipede();
+
+            centipedeTime += 4;      
+         }
+
+         if (fleaTime < time)
+         {
+            updateFlea();
+
+            fleaTime += 5;
+         }   
+        
+         if (explosionTime < time)
+         {
+            updateExplosion();
+
+            explosionTime += 8;      
+         } 
+         tab(7, 30);
+
+
+         printf("%i", score);   
+      } 
+      while (ship.active == True || explosion.active == True);
+   }
+                       
+   tab(15, 14);
+   printf("GAME OVER!");
+
+   for (;;);
+}
+
+/******************************************************************************/
